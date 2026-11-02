@@ -148,6 +148,22 @@ in red:
 brow-tool.py --profiles --summary --chrome
 ```
 
+### Find (and delete) dead bookmarks
+
+```bash
+# Check every http(s) bookmark; report those that fail to load
+brow-tool.py --bookmarks --chrome
+brow-tool.py --bookmarks="Work" --chrome
+
+# Also delete the failed ones (asks first; close Chrome; Bookmarks file is backed up)
+brow-tool.py --bookmarks --delete-failed --chrome
+```
+
+Connection errors, 404s and 5xx responses count as failed. 401/403/429 are
+reported as *blocked* (the site likely exists but rejects scripts) and are never
+deleted. Use `--timeout SECONDS` to adjust the per-request timeout (default 10).
+With Chrome sync enabled, deleted bookmarks may be restored from the sync server.
+
 ### Default scan locations
 
 When `--chrome` is given without a path, these are searched in order:

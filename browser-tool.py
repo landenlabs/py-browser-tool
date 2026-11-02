@@ -24,6 +24,7 @@ VERSION = "v6.05.23"
 
 _RED    = '\033[31m'
 _RESET  = '\033[0m'
+_YELLOW = '\033[33m'
 _USE_COLOR = False
 
 
@@ -862,6 +863,216 @@ def clean_chrome(chrome_arg, target, assume_yes=False):
 
 
 # ---------------------------------------------------------------------------
+# Bookmark verification
+# ---------------------------------------------------------------------------
+
+# HTTP statuses that mean "the server answered but refuses automated clients";
+# the page probably exists, so these are reported but never deleted.
+BLOCKED_STATUSES = {401, 403, 429, 999}
+BOOKMARK_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                       '(KHTML, like Gecko) Chrome/124.0 Safari/537.36')
+
+
+def extract_bookmark_urls(node, folder='', out=None):
+    """Walk a Chrome Bookmarks JSON tree; return a list of (guid, name, url, folder)."""
+    if out is None:
+        out = []
+    if isinstance(node, dict):
+        if node.get('type') == 'url':
+            out.append((node.get('guid', ''), node.get('name', ''), node.get('url', ''), folder))
+        elif 'children' in node:
+            sub = f"{folder}/{node.get('name', '')}" if folder else node.get('name', '')
+            for child in node['children']:
+                extract_bookmark_urls(child, sub, out)
+        else:
+            # Top-level container: {'roots': {'bookmark_bar': {...}, ...}}
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    extract_bookmark_urls(value, folder, out)
+    elif isinstance(node, list):
+        for item in node:
+            extract_bookmark_urls(item, folder, out)
+    return out
+
+
+def check_url(url, timeout):
+    """Return (status, detail). status is an int HTTP code, or None on a network error."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    ctx = ssl.create_default_context()
+    last = (None, '')
+    for method in ('HEAD', 'GET'):
+        req = urllib.request.Request(url, method=method, headers={'User-Agent': BOOKMARK_USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.status, resp.reason
+        except urllib.error.HTTPError as err:
+            last = (err.code, str(err.reason))
+            # Many servers mishandle HEAD; retry those with GET before judging.
+            if method == 'HEAD' and err.code >= 400:
+                continue
+            return last
+        except Exception as err:  # DNS failure, refused, TLS error, timeout, bad URL ...
+            reason = getattr(err, 'reason', err)
+            last = (None, f"{type(reason).__name__}: {reason}")
+            if method == 'HEAD':
+                continue
+            return last
+    return last
+
+
+def _classify(status):
+    if status is None:
+        return 'failed'
+    if status < 400:
+        return 'ok'
+    if status in BLOCKED_STATUSES:
+        return 'blocked'
+    return 'failed'
+
+
+def delete_bookmarks_from_file(bookmarks_path, guids):
+    """Remove bookmark entries with the given guids; back up the file first. Returns count removed."""
+    with open(bookmarks_path, 'r', encoding='utf-8') as fh:
+        data = json.load(fh)
+
+    removed = 0
+
+    def prune(node):
+        nonlocal removed
+        children = node.get('children')
+        if not isinstance(children, list):
+            return
+        kept = []
+        for child in children:
+            if child.get('type') == 'url' and child.get('guid') in guids:
+                removed += 1
+            else:
+                prune(child)
+                kept.append(child)
+        node['children'] = kept
+
+    for root in data.get('roots', {}).values():
+        if isinstance(root, dict):
+            prune(root)
+
+    backup = Path(str(bookmarks_path) + '.' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.bak')
+    shutil.copy2(bookmarks_path, backup)
+    # Chrome recomputes the checksum when it is absent; a stale one is treated as corruption.
+    data.pop('checksum', None)
+    with open(bookmarks_path, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, indent=3, ensure_ascii=False)
+    print(f"  [*] Backup saved to {backup}")
+    return removed
+
+
+def check_profile_bookmarks(name, display, profile_path, delete=False, assume_yes=False,
+                            timeout=10, workers=16):
+    """Verify every http(s) bookmark in one profile; optionally delete the failed ones."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    bookmarks_path = profile_path / 'Bookmarks'
+    label = f"{name} ({display})" if display else name
+    if not _safe_exists(bookmarks_path):
+        print(f"[*] {label}: no Bookmarks file.\n")
+        return 0
+
+    try:
+        with open(bookmarks_path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as err:
+        print(f"[-] {label}: cannot read {bookmarks_path}: {err}", file=sys.stderr)
+        return 0
+
+    entries = extract_bookmark_urls(data.get('roots', {}))
+    checkable = [e for e in entries if e[2].lower().startswith(('http://', 'https://'))]
+    print(f"[*] {label}: checking {len(checkable)} of {len(entries)} bookmarks "
+          f"(skipping non-http URLs)...")
+
+    results = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(check_url, e[2], timeout): e for e in checkable}
+        for fut in as_completed(futures):
+            entry = futures[fut]
+            results[entry[0] or entry[2]] = (entry, fut.result())
+            done += 1
+            if sys.stdout.isatty():
+                print(f"\r  {done}/{len(checkable)}", end='', flush=True)
+    if sys.stdout.isatty() and checkable:
+        print('\r' + ' ' * 20 + '\r', end='')
+
+    failed, blocked = [], []
+    for entry, (status, detail) in results.values():
+        kind = _classify(status)
+        if kind == 'failed':
+            failed.append((entry, status, detail))
+        elif kind == 'blocked':
+            blocked.append((entry, status, detail))
+
+    for entry, status, detail in sorted(failed, key=lambda f: (f[0][3], f[0][1])):
+        code = status if status is not None else 'ERR'
+        print(f"  {_c(f'[FAILED {code}]', _RED)} {entry[1]}\n      {entry[2]}\n"
+              f"      folder: {entry[3]}  {detail}")
+    for entry, status, _ in sorted(blocked, key=lambda f: (f[0][3], f[0][1])):
+        print(f"  {_c(f'[BLOCKED {status}]', _YELLOW)} {entry[1]}: {entry[2]} (kept)")
+
+    print(f"\n  {len(checkable) - len(failed) - len(blocked)} ok, {len(failed)} failed, "
+          f"{len(blocked)} blocked/restricted (never deleted)\n")
+
+    if not delete or not failed:
+        return len(failed)
+
+    print(f"  [!] Chrome must be closed, or it will overwrite the Bookmarks file on exit.")
+    if not assume_yes:
+        answer = input(f"  Delete {len(failed)} failed bookmark{'s' if len(failed) != 1 else ''} "
+                       f"from {label}? [y/N] ").strip().lower()
+        if answer not in ('y', 'yes'):
+            print("  [*] Aborted, nothing removed.\n")
+            return len(failed)
+
+    try:
+        removed = delete_bookmarks_from_file(bookmarks_path, {e[0] for e, _, _ in failed if e[0]})
+    except (OSError, ValueError) as err:
+        print(f"  [-] Failed to update {bookmarks_path}: {err}", file=sys.stderr)
+        return len(failed)
+    print(f"  [*] Deleted {removed} bookmark{'s' if removed != 1 else ''}. "
+          f"If Chrome sync is on, they may reappear from the sync server.\n")
+    return len(failed)
+
+
+def check_bookmarks_directory(chrome_dir, target, delete=False, assume_yes=False, timeout=10):
+    root_path = Path(chrome_dir)
+    if not _safe_exists(root_path):
+        print(f"[-] Error: The path '{chrome_dir}' does not exist.", file=sys.stderr)
+        return
+    profile_names = load_chrome_profile_names(root_path)
+    selected = [(n, p) for n, p in _iter_profile_dirs(root_path)
+                if target in (None, 'ALL') or _profile_matches(n, profile_names.get(n, ''), target)]
+    if not selected:
+        print(f"[-] Error: Profile '{target}' not found under {root_path}.", file=sys.stderr)
+        return
+    for name, path in selected:
+        check_profile_bookmarks(name, profile_names.get(name, ''), path, delete, assume_yes, timeout)
+
+
+def check_bookmarks(chrome_arg, target, delete=False, assume_yes=False, timeout=10):
+    """Dispatch a bookmark check: explicit path, or the first default OS location found."""
+    if chrome_arg and chrome_arg != 'AUTO':
+        return check_bookmarks_directory(chrome_arg, target, delete, assume_yes, timeout)
+    path = get_default_chrome_path()
+    if not path:
+        print(f"[-] No Chrome installation found in standard locations "
+              f"for {platform.system()}.", file=sys.stderr)
+        return
+    print(f"[*] No --chrome path given; using default location for "
+          f"{platform.system()}: {path}\n")
+    return check_bookmarks_directory(str(path), target, delete, assume_yes, timeout)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -898,6 +1109,14 @@ def main():
   # Remove those same items from just "Profile 1", by internal or display name:
   brow-tool.py --clean="Profile 1" --chrome
   brow-tool.py --clean="Work" --chrome
+
+  # Check every http(s) bookmark and report the ones that fail to load:
+  brow-tool.py --bookmarks --chrome
+  brow-tool.py --bookmarks="Work" --chrome
+
+  # Same, then offer to delete the failed ones (close Chrome first; a backup is kept):
+  brow-tool.py --bookmarks --delete-failed --chrome
+  brow-tool.py --bookmarks --delete-failed -y --chrome
 
   # Scan a specific Chrome User Data directory:
   brow-tool.py --summary --chrome "%LOCALAPPDATA%\\Google\\Chrome\\User Data"
@@ -980,9 +1199,32 @@ Notes:
              "(e.g. 'Profile 10') or display name (e.g. 'Work')",
     )
     parser.add_argument(
+        '--bookmarks',
+        nargs='?',
+        const='ALL',
+        default=None,
+        metavar='PROFILE',
+        help='Check every http(s) bookmark and report which fail to load (connection error, '
+             '404, 5xx ...). 401/403/429 are reported as blocked and are never deleted. '
+             'With no value, checks all profiles; with a value, only the matching profile',
+    )
+    parser.add_argument(
+        '--delete-failed',
+        action='store_true',
+        help='With --bookmarks, delete the failed bookmarks (asks first; backs up the '
+             'Bookmarks file; close Chrome beforehand)',
+    )
+    parser.add_argument(
+        '--timeout',
+        type=float,
+        default=10,
+        metavar='SECONDS',
+        help='With --bookmarks, per-request timeout (default: 10)',
+    )
+    parser.add_argument(
         '-y', '--yes',
         action='store_true',
-        help='Skip the confirmation prompt when using --clean',
+        help='Skip the confirmation prompt when using --clean or --delete-failed',
     )
     parser.add_argument(
         '--chrome',
@@ -1012,8 +1254,12 @@ Notes:
     if args.chrome is None:
         parser.error("at least one browser must be specified (e.g., --chrome)")
 
-    if not (args.summary is not None or args.profiles or args.space is not None or args.clean):
-        parser.error("specify at least one of --summary, --profiles, --space, or --clean")
+    if not (args.summary is not None or args.profiles or args.space is not None or args.clean
+            or args.bookmarks is not None):
+        parser.error("specify at least one of --summary, --profiles, --space, --clean, or --bookmarks")
+
+    if args.delete_failed and args.bookmarks is None:
+        parser.error("--delete-failed requires --bookmarks")
 
     if args.profiles or args.space is not None:
         profile_filter = args.space if args.space not in (None, 'ALL') else None
@@ -1026,6 +1272,10 @@ Notes:
 
     if args.clean:
         clean_chrome(args.chrome, args.clean, assume_yes=args.yes)
+
+    if args.bookmarks is not None:
+        check_bookmarks(args.chrome, args.bookmarks, delete=args.delete_failed,
+                        assume_yes=args.yes, timeout=args.timeout)
 
 
 if __name__ == "__main__":
